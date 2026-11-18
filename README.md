@@ -1,9 +1,15 @@
 # RWG3
 
-Realistic World Generator 3 is a Minecraft 1.7.10/GTNH mod in development. Its first component is a deterministic,
-hexagon-based tectonic and hydrology planner ported from the iVy prototype.
+RWG3 is in development. Its first component is a deterministic,
+hexagon-based tectonic and hydrology planner. The main idea is to be able to fine-tune the worldgen from a 2d preview,
+with CubicChunk & DH worldgen using the same inputs as the 2d preview.
 
-## Planner preview
+<img width="1334" height="918" alt="image" src="https://github.com/user-attachments/assets/e976bf80-01bf-4d3d-8794-d8b14e720de0" />
+
+At the moment, there is only the preview tool on the repo, as it should be the development focus.
+Actual CC worldgen is in the work, but not pushed on this repo. Soon™️
+
+## 2D preview tool
 
 Run the preview directly from the project:
 
@@ -17,9 +23,8 @@ The built mod JAR is also executable:
 java -jar build/libs/RWG3-<version>.jar
 ```
 
-Use `Tab` and `Shift+Tab` to move through the eight visible planning stages. Enter a signed 64-bit seed and press
-`Enter` to
-regenerate, or use the circular-arrow button/`R` shortcut for a random seed.
+Use `Tab` and `Shift+Tab` (or just the arrows) to move through all the visible 2d planning stages. Enter a signed 64-bit seed and press
+`Enter` to regenerate, or use the circular-arrow button/`R` shortcut for a random seed.
 
 Use the mouse wheel to zoom toward the cursor, drag with the left or middle mouse button to pan, and press `Home` to
 reset the viewport. The final heightmap shows block coordinates and surface height beside the cursor.
