@@ -3,8 +3,6 @@ package com.irythill.rwg3.preview;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Dimension;
-import java.awt.Font;
-import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.Point;
@@ -14,99 +12,64 @@ import java.awt.event.ComponentEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
-import java.awt.geom.Rectangle2D;
+import java.awt.geom.Line2D;
+import java.awt.geom.Path2D;
 import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferInt;
-import java.util.Arrays;
-import java.util.List;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Map.Entry;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 
-import javax.swing.JPanel;
-import javax.swing.SwingUtilities;
-import javax.swing.Timer;
+import javax.imageio.ImageIO;
+import javax.swing.JComponent;
+import javax.swing.JToolTip;
 
-import com.irythill.rwg3.preview.RenderBuffer.HexSample;
-import com.irythill.rwg3.procgen.GenerationStep;
-import com.irythill.rwg3.procgen.continent.ContinentGenerator.StepDefinition;
-import com.irythill.rwg3.procgen.continent.Hex;
-import com.irythill.rwg3.procgen.util.hex.AxialCoordinate;
-import com.irythill.rwg3.procgen.util.hex.Vec2;
-import com.irythill.rwg3.procgen.world.WorldGenerator;
-import com.irythill.rwg3.procgen.world.WorldGenerator.ComposedSample;
-import com.irythill.rwg3.procgen.world.WorldGenerator.TerrainLabel;
-import com.irythill.rwg3.procgen.world.WorldGenerator.WorldStepDefinition;
+import com.irythill.rwg3.util.hex.AxialCoordinate;
+import com.irythill.rwg3.util.hex.HexGrid;
+import com.irythill.rwg3.util.hex.Vec2;
+import com.irythill.rwg3.world.Biome;
+import com.irythill.rwg3.world.Hex;
+import com.irythill.rwg3.world.World;
+import com.irythill.rwg3.world.WorldGenerator.StepDefinition;
 
-/** Overscanned, cancellable and progressively refined world preview. */
-public final class PreviewCanvas extends JPanel implements AutoCloseable {
+/** Interactive view of one already-generated fixed world. */
+public final class PreviewCanvas extends JComponent {
 
-    private static final long serialVersionUID = 1L;
-    private static final Color BACKGROUND = new Color(19, 21, 26);
-    private static final int TILE_SIZE = 16;
-    private static final int PUBLISH_TILE_INTERVAL = 32;
-    private final AtomicLong tickets = new AtomicLong();
-    private final int workerCount = Math.max(
-        1,
-        Runtime.getRuntime()
-            .availableProcessors() - 1);
-    private final ThreadPoolExecutor coordinator = new ThreadPoolExecutor(
-        1,
-        1,
-        0,
-        TimeUnit.MILLISECONDS,
-        new LinkedBlockingQueue<>(),
-        runnable -> daemon(runnable, "rwg-preview-coordinator"));
-    private final ExecutorService workers = Executors
-        .newFixedThreadPool(workerCount, runnable -> daemon(runnable, "rwg-preview-worker"));
-    private final Timer panTimer = new Timer(100, event -> rebuildAligned());
-    private final Timer planRefreshTimer = new Timer(100, event -> refreshIncomplete());
-    private transient WorldGenerator composer;
-    private GenerationStep stage;
-    private GenerationStep columnStage;
-    private transient Runnable viewportListener;
-    private transient Consumer<Map<GenerationStep, Double>> timingListener;
-    private transient Point dragOrigin;
-    private transient Point hoverPoint;
-    private double centerX, centerY, zoom = 1;
-    private long seed, lastPanBufferNanos;
-    private volatile RenderBuffer buffer;
-    private volatile RenderBuffer columnBuffer;
+    private static final int RASTER_SIZE = 1080;
+    private static final double RASTER_PIXELS_PER_UNIT = RASTER_SIZE / World.WIDTH;
+    private static final double VECTOR_RENDER_PIXELS_PER_UNIT = RASTER_PIXELS_PER_UNIT * 4.0;
+    private static final double HEX_HALF_HEIGHT = Math.sqrt(3.0) / 3.0;
+    private static final double HEX_OVERDRAW_PIXELS = 0.75;
+    private static final double SLOPE_SAMPLE_DISTANCE = 2.0;
+    private static final double TREE_ICON_SIZE_PER_UNIT = 1.17;
+    private static final int OVERVIEW_TREE_ICON_SIZE = 16;
+    private static final int OVERVIEW_TREE_STRIDE = 5;
+
+    private final Map<Integer, BufferedImage> stageImages = new HashMap<>();
+    private final Map<Integer, BufferedImage> stageImagesWithTrees = new HashMap<>();
+    private final Map<Integer, Path2D> stageContours = new HashMap<>();
+    private final Map<Biome, BufferedImage> treeIcons = loadTreeIcons();
+    private final JToolTip hoverTip = createToolTip();
+    private Point hoverPoint;
+    private boolean showTreeIcons = true;
+    private World world;
+    private StepDefinition stage;
+    private double centerX = World.WIDTH * 0.5;
+    private double centerY = World.WIDTH * 0.5;
+    private double zoom = 1.0;
+    private Point dragStart;
+    private double dragCenterX, dragCenterY;
 
     public PreviewCanvas() {
-        setBackground(BACKGROUND);
-        setFocusable(true);
-        setFocusTraversalKeysEnabled(false);
-        setPreferredSize(new Dimension(860, 860));
-        panTimer.setRepeats(false);
-        planRefreshTimer.setRepeats(false);
+        setOpaque(true);
+        setBackground(new Color(8, 10, 16));
         MouseAdapter navigation = new MouseAdapter() {
 
             @Override
-            public void mousePressed(MouseEvent event) {
-                requestFocusInWindow();
-                if (event.getButton() == MouseEvent.BUTTON1 || event.getButton() == MouseEvent.BUTTON2)
-                    dragOrigin = event.getPoint();
-            }
-
-            @Override
-            public void mouseDragged(MouseEvent event) {
-                hoverPoint = event.getPoint();
-                if (dragOrigin == null) return;
-                double scale = pixelsPerUnit();
-                centerX -= (event.getX() - dragOrigin.x) / scale;
-                centerY += (event.getY() - dragOrigin.y) / scale;
-                dragOrigin = event.getPoint();
-                panChanged();
+            public void mouseEntered(MouseEvent event) {
+                mouseMoved(event);
             }
 
             @Override
@@ -122,13 +85,33 @@ public final class PreviewCanvas extends JPanel implements AutoCloseable {
             }
 
             @Override
+            public void mousePressed(MouseEvent event) {
+                dragStart = event.getPoint();
+                hoverPoint = dragStart;
+                dragCenterX = centerX;
+                dragCenterY = centerY;
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent event) {
+                if (dragStart == null) return;
+                hoverPoint = event.getPoint();
+                double scale = pixelsPerUnit();
+                centerX = wrap(dragCenterX - (event.getX() - dragStart.x) / scale);
+                centerY = wrap(dragCenterY + (event.getY() - dragStart.y) / scale);
+                repaint();
+            }
+
+            @Override
             public void mouseReleased(MouseEvent event) {
-                dragOrigin = null;
-                rebuildAligned();
+                dragStart = null;
+                hoverPoint = contains(event.getPoint()) ? event.getPoint() : null;
+                repaint();
             }
 
             @Override
             public void mouseWheelMoved(MouseWheelEvent event) {
+                hoverPoint = event.getPoint();
                 zoomAt(event.getX(), event.getY(), Math.pow(1.12, -event.getPreciseWheelRotation()));
             }
         };
@@ -139,746 +122,374 @@ public final class PreviewCanvas extends JPanel implements AutoCloseable {
 
             @Override
             public void componentResized(ComponentEvent event) {
-                rebuildAligned();
+                repaint();
             }
         });
     }
 
-    public void setWorld(WorldGenerator source, long worldSeed) {
-        composer = source;
-        seed = worldSeed;
-        stage = source.steps()
-            .get(0);
-        columnStage = null;
-        for (GenerationStep candidate : source.steps()) if (candidate instanceof WorldStepDefinition) {
-            columnStage = candidate;
-            break;
-        }
-        columnBuffer = null;
-        replaceBuffer(false, false);
+    public void setWorld(World value, StepDefinition initialStage) {
+        world = value;
+        stage = initialStage;
+        stageImages.clear();
+        stageImagesWithTrees.clear();
+        stageContours.clear();
+        resetView();
     }
 
-    public void setWorld(WorldGenerator source) {
-        setWorld(source, 0L);
+    public void setStage(StepDefinition value) {
+        stage = value;
+        repaint();
     }
 
-    public void setStage(GenerationStep value) {
-        if (stage != value) {
-            RenderBuffer current = buffer;
-            boolean currentIsColumns = current != null && current.stage instanceof WorldStepDefinition;
-            boolean nextIsColumns = value instanceof WorldStepDefinition;
-            stage = value;
-            if (currentIsColumns && nextIsColumns) {
-                current.stage = value;
-                selectColumnStage(current, value);
-                repaint();
-                return;
-            }
-            if (currentIsColumns) columnBuffer = current;
-            if (nextIsColumns && current != null && columnBuffer != null && columnBuffer.sameProjection(current)) {
-                tickets.incrementAndGet();
-                coordinator.getQueue()
-                    .clear();
-                columnBuffer.stage = value;
-                selectColumnStage(columnBuffer, value);
-                buffer = columnBuffer;
-                repaint();
-                if (!columnBuffer.rendered) schedule(columnBuffer);
-                return;
-            }
-            replaceBuffer(false, false);
-        }
-    }
-
-    private static void selectColumnStage(RenderBuffer target, GenerationStep selected) {
-        boolean source = ((WorldStepDefinition) selected).index == 2;
-        for (int index = 0; index < target.elevations.length; index++)
-            target.elevations[index] = source ? target.sourceElevations[index] : target.finalElevations[index];
-        colorizeHeightmap(target);
-    }
-
-    public void setViewportListener(Runnable listener) {
-        viewportListener = listener;
-    }
-
-    public void setTimingListener(Consumer<Map<GenerationStep, Double>> listener) {
-        timingListener = listener;
-    }
-
-    public Rectangle2D worldBounds() {
-        RenderBuffer current = buffer;
-        if (current != null) return new Rectangle2D.Double(
-            current.minimumX(),
-            current.minimumY(),
-            current.maximumX() - current.minimumX(),
-            current.maximumY() - current.minimumY());
-        double u = unitsPerPixel();
-        return new Rectangle2D.Double(
-            centerX - getWidth() * u / 2,
-            centerY - getHeight() * u / 2,
-            getWidth() * u,
-            getHeight() * u);
-    }
-
-    public double centerX() {
-        return centerX;
-    }
-
-    public double centerY() {
-        return centerY;
-    }
-
-    public void planCompleted() {
-        planRefreshTimer.restart();
-    }
-
-    private void refreshIncomplete() {
-        RenderBuffer current = buffer;
-        if (current == null) return;
-        boolean currentChanged = invalidateIncomplete(current);
-        RenderBuffer columns = columnBuffer;
-        boolean columnsChanged = columns != null && columns != current && invalidateIncomplete(columns);
-        if (currentChanged) schedule(current);
-        else if (columnsChanged && current.stage instanceof StepDefinition) preloadColumns(current);
-    }
-
-    private static boolean invalidateIncomplete(RenderBuffer target) {
-        boolean changed = false;
-        target.samples.entrySet()
-            .removeIf(entry -> !entry.getValue().complete);
-        for (int i = 0; i < target.valid.length; i++) if (target.valid[i] && !target.complete[i]) {
-            target.valid[i] = false;
-            changed = true;
-        }
-        if (changed) target.rendered = false;
-        return changed;
+    public void setShowTreeIcons(boolean show) {
+        showTreeIcons = show;
+        repaint();
     }
 
     public void resetView() {
-        centerX = centerY = 0;
-        zoom = 1;
-        replaceBuffer(true, false);
-    }
-
-    private void zoomAt(double sx, double sy, double factor) {
-        double old = pixelsPerUnit(), wx = centerX + (sx - getWidth() / 2.0) / old;
-        double wy = centerY - (sy - getHeight() / 2.0) / old;
-        zoom = Math.max(.08, Math.min(30, zoom * factor));
-        double next = pixelsPerUnit();
-        centerX = wx - (sx - getWidth() / 2.0) / next;
-        centerY = wy + (sy - getHeight() / 2.0) / next;
-        replaceBuffer(false, true);
-    }
-
-    private double pixelsPerUnit() {
-        return 860.0 / 180.0 * zoom;
-    }
-
-    private double unitsPerPixel() {
-        return 1 / pixelsPerUnit();
-    }
-
-    private void panChanged() {
+        centerX = centerY = World.WIDTH * 0.5;
+        zoom = 1.0;
         repaint();
-        RenderBuffer current = buffer;
-        if (current != null && viewportInside(current)) return;
-        long elapsed = (System.nanoTime() - lastPanBufferNanos) / 1_000_000;
-        if (elapsed >= 100) rebuildAligned();
-        else if (!panTimer.isRunning()) {
-            panTimer.setInitialDelay((int) (100 - elapsed));
-            panTimer.start();
-        }
-    }
-
-    private boolean viewportInside(RenderBuffer value) {
-        double u = unitsPerPixel(), left = centerX - getWidth() * u / 2, right = centerX + getWidth() * u / 2;
-        double bottom = centerY - getHeight() * u / 2, top = centerY + getHeight() * u / 2;
-        return left >= value.minimumX() && right <= value.maximumX()
-            && bottom >= value.minimumY()
-            && top <= value.maximumY();
-    }
-
-    private void rebuildAligned() {
-        lastPanBufferNanos = System.nanoTime();
-        replaceBuffer(true, false);
-    }
-
-    private void replaceBuffer(boolean aligned, boolean reproject) {
-        if (composer == null || getWidth() < 2 || getHeight() < 2) {
-            repaint();
-            return;
-        }
-        RenderBuffer old = buffer;
-        double u = unitsPerPixel();
-        int width = (int) Math.ceil(getWidth() * 1.2), height = (int) Math.ceil(getHeight() * 1.2);
-        double ox = centerX - width * u / 2, oy = centerY + height * u / 2;
-        if (aligned && old != null && old.unitsPerPixel == u) {
-            ox = old.originX + Math.rint((ox - old.originX) / u) * u;
-            oy = old.originY + Math.rint((oy - old.originY) / u) * u;
-        }
-        RenderBuffer next = new RenderBuffer(width, height, ox, oy, u, seed, stage, composer);
-        if (!reproject && !aligned) next.copyVisual(old);
-        if (reproject) next.reproject(old);
-        if (aligned) next.copyAligned(old);
-        buffer = next;
-        if (stage instanceof WorldStepDefinition) columnBuffer = next;
-        repaint();
-        if (viewportListener != null) viewportListener.run();
-        schedule(next);
-    }
-
-    private void schedule(RenderBuffer target) {
-        target.rendered = false;
-        long ticket = tickets.incrementAndGet();
-        coordinator.getQueue()
-            .clear();
-        coordinator.execute(() -> generate(ticket, target));
-    }
-
-    private void generate(long ticket, RenderBuffer target) {
-        boolean rasterizeHexes = target.stage instanceof StepDefinition && target.unitsPerPixel < 0.5;
-        int tilesWide = (target.width + TILE_SIZE - 1) / TILE_SIZE;
-        int tilesHigh = (target.height + TILE_SIZE - 1) / TILE_SIZE;
-        int minimumQ = 0, minimumR = 0, coordinatesWide = 0;
-        int workCount;
-        if (rasterizeHexes) {
-            double denominator = 2.0 * Math.sqrt(3.0) / 3.0;
-            double minimumX = target.minimumX(), maximumX = target.maximumX();
-            double minimumY = target.minimumY(), maximumY = target.maximumY();
-            minimumQ = (int) Math.floor(minimumX * 0.5 + minimumY / denominator) - 1;
-            int maximumQ = (int) Math.ceil(maximumX * 0.5 + maximumY / denominator) + 1;
-            minimumR = (int) Math.floor(minimumX * 0.5 - maximumY / denominator) - 1;
-            int maximumR = (int) Math.ceil(maximumX * 0.5 - minimumY / denominator) + 1;
-            coordinatesWide = maximumQ - minimumQ + 1;
-            workCount = coordinatesWide * (maximumR - minimumR + 1);
-        } else {
-            workCount = tilesWide * tilesHigh;
-        }
-        final int firstQ = minimumQ;
-        final int firstR = minimumR;
-        final int qCount = coordinatesWide;
-        AtomicInteger nextWork = new AtomicInteger();
-        AtomicInteger completedWork = new AtomicInteger();
-        CountDownLatch done = new CountDownLatch(workerCount);
-        for (int worker = 0; worker < workerCount; worker++) {
-            workers.execute(() -> {
-                try {
-                    while (tickets.get() == ticket) {
-                        int work = nextWork.getAndIncrement();
-                        if (work >= workCount) break;
-                        if (rasterizeHexes)
-                            renderHexCell(ticket, target, firstQ + work % qCount, firstR + work / qCount);
-                        else renderTile(ticket, target, work % tilesWide, work / tilesWide);
-                        int completed = completedWork.incrementAndGet();
-                        int publishInterval = rasterizeHexes ? 256 : PUBLISH_TILE_INTERVAL;
-                        if (completed % publishInterval == 0) publish(ticket, target);
-                    }
-                } finally {
-                    done.countDown();
-                }
-            });
-        }
-        try {
-            done.await();
-        } catch (InterruptedException exception) {
-            Thread.currentThread()
-                .interrupt();
-        }
-        if (tickets.get() == ticket && isBlockHeightmap(target.stage)) colorizeHeightmap(target);
-        if (tickets.get() == ticket && hasRegionLabels(target.stage)) colorizeTerrainRegionContours(target);
-        if (hasRegionLabels(target.stage)) {
-            target.hoveredRegionKey = Long.MIN_VALUE;
-            target.hoveredRegionOverlay = null;
-        }
-        if (tickets.get() == ticket && hasArrows(target.stage)) renderMotionArrows(target);
-        if (tickets.get() == ticket && timingListener != null) {
-            Map<GenerationStep, Double> values = target.stage instanceof StepDefinition
-                ? ((WorldGenerator) target.generation).continentTimingsMicrosPerHex()
-                : target.timingSession.cumulativeMicrosPerSample();
-            SwingUtilities.invokeLater(() -> timingListener.accept(values));
-        }
-        boolean finished = tickets.get() == ticket;
-        target.rendered = finished;
-        publish(ticket, target);
-        if (finished && buffer == target && target.stage instanceof StepDefinition) preloadColumns(target);
-    }
-
-    private void preloadColumns(RenderBuffer visibleHexes) {
-        if (columnStage == null || buffer != visibleHexes || !(visibleHexes.stage instanceof StepDefinition)) return;
-        RenderBuffer prepared = columnBuffer;
-        if (prepared == null || !prepared.sameProjection(visibleHexes)) {
-            prepared = new RenderBuffer(
-                visibleHexes.width,
-                visibleHexes.height,
-                visibleHexes.originX,
-                visibleHexes.originY,
-                visibleHexes.unitsPerPixel,
-                visibleHexes.seed,
-                columnStage,
-                visibleHexes.generation);
-            columnBuffer = prepared;
-        }
-        if (prepared.rendered) return;
-        long ticket = tickets.incrementAndGet();
-        RenderBuffer target = prepared;
-        coordinator.execute(() -> generate(ticket, target));
-    }
-
-    private void renderHexCell(long ticket, RenderBuffer target, int q, int r) {
-        double centerX = q + r;
-        double centerY = (q - r) * Math.sqrt(3.0) / 3.0;
-        double radius = Math.sqrt(3.0) / 3.0;
-        if (centerX + 2.0 / 3.0 < target.minimumX() || centerX - 2.0 / 3.0 > target.maximumX()
-            || centerY + radius < target.minimumY()
-            || centerY - radius > target.maximumY()) return;
-        long key = (long) q & 0xffffffffL | (long) r << 32;
-        HexSample sample = target.samples.computeIfAbsent(key, ignored -> sampleHex(target, q, r));
-        if (tickets.get() != ticket) return;
-        double screenCenterY = (target.originY - centerY) / target.unitsPerPixel;
-        int minimumY = Math.max(0, (int) Math.ceil(screenCenterY - radius / target.unitsPerPixel - 0.5));
-        int maximumY = Math.min(target.height, (int) Math.ceil(screenCenterY + radius / target.unitsPerPixel - 0.5));
-        for (int y = minimumY; y < maximumY; y++) {
-            double worldY = target.originY - (y + 0.5) * target.unitsPerPixel;
-            double distanceY = Math.abs(worldY - centerY);
-            double halfWidth = 2.0 / 3.0 - distanceY / Math.sqrt(3.0);
-            if (halfWidth <= 0.0) continue;
-            int minimumX = Math
-                .max(0, (int) Math.ceil((centerX - halfWidth - target.originX) / target.unitsPerPixel - 0.5));
-            int maximumX = Math.min(
-                target.width,
-                (int) Math.ceil((centerX + halfWidth - target.originX) / target.unitsPerPixel - 0.5));
-            if (minimumX >= maximumX) continue;
-            int from = y * target.width + minimumX;
-            int to = y * target.width + maximumX;
-            Arrays.fill(target.pixels, from, to, sample.color);
-            Arrays.fill(target.elevations, from, to, sample.elevation);
-            Arrays.fill(target.sourceElevations, from, to, sample.sourceElevation);
-            Arrays.fill(target.finalElevations, from, to, sample.finalElevation);
-            Arrays.fill(target.terrainRegionIds, from, to, sample.terrainRegionId);
-            Arrays.fill(target.terrainRegionKeys, from, to, sample.terrainRegionKey);
-            Arrays.fill(target.tooltips, from, to, sample.tooltip);
-            Arrays.fill(target.complete, from, to, sample.complete);
-            Arrays.fill(target.valid, from, to, true);
-        }
-    }
-
-    private void renderTile(long ticket, RenderBuffer target, int tileX, int tileY) {
-        int minimumX = tileX * TILE_SIZE;
-        int minimumY = tileY * TILE_SIZE;
-        int maximumX = Math.min(minimumX + TILE_SIZE, target.width);
-        int maximumY = Math.min(minimumY + TILE_SIZE, target.height);
-        for (int y = minimumY; y < maximumY; y++) {
-            if (tickets.get() != ticket) return;
-            double worldY = target.originY - (y + .5) * target.unitsPerPixel;
-            for (int x = minimumX; x < maximumX; x++) {
-                int index = y * target.width + x;
-                if (target.valid[index]) continue;
-                double worldX = target.originX + (x + .5) * target.unitsPerPixel;
-                HexSample sample;
-                if (isBlockHeightmap(target.stage)) {
-                    ComposedSample composed = ((WorldGenerator) target.generation)
-                        .sample(worldX, worldY, target.stage, target.timingSession);
-                    sample = new HexSample(
-                        color(composed, target.stage),
-                        composed.elevation,
-                        composed.sourceElevation,
-                        composed.finalElevation,
-                        composed.complete,
-                        0.0,
-                        0.0,
-                        0,
-                        0L,
-                        ((WorldStepDefinition) target.stage).tooltip == null ? null
-                            : ((WorldStepDefinition) target.stage).tooltip.apply(composed));
-                } else {
-                    long key = AxialCoordinate.packedFromWorld(worldX, worldY);
-                    int q = (int) key, r = (int) (key >>> 32);
-                    sample = target.unitsPerPixel < 0.75 || hasArrows(target.stage)
-                        ? target.samples.computeIfAbsent(key, ignored -> sampleHex(target, q, r))
-                        : sampleHex(target, q, r);
-                }
-                if (tickets.get() != ticket) return;
-                target.pixels[index] = sample.color;
-                target.elevations[index] = sample.elevation;
-                target.sourceElevations[index] = sample.sourceElevation;
-                target.finalElevations[index] = sample.finalElevation;
-                target.terrainRegionIds[index] = sample.terrainRegionId;
-                target.terrainRegionKeys[index] = sample.terrainRegionKey;
-                target.tooltips[index] = sample.tooltip;
-                target.complete[index] = sample.complete;
-                target.valid[index] = true;
-                if (isBlockHeightmap(target.stage)) colorizeHeightmapDependencies(target, x, y);
-            }
-        }
-    }
-
-    private static HexSample sampleHex(RenderBuffer target, int q, int r) {
-        double centerX = q + r;
-        double centerY = (q - r) * Math.sqrt(3.0) / 3.0;
-        ComposedSample sample = ((WorldGenerator) target.generation).sample(centerX, centerY, target.stage);
-        Hex hex = hex(sample);
-        Vec2 arrow = target.stage instanceof StepDefinition && ((StepDefinition) target.stage).arrow != null
-            ? ((StepDefinition) target.stage).arrow.apply(hex)
-            : Vec2.ZERO;
-        String tooltip = target.stage instanceof StepDefinition && ((StepDefinition) target.stage).tooltip != null
-            ? ((StepDefinition) target.stage).tooltip.apply(hex)
-            : null;
-        long regionKey = sample.terrainRegionId == 0 ? 0L
-            : sample.siteId * 0x9E3779B97F4A7C15L ^ Integer.toUnsignedLong(sample.terrainRegionId);
-        return new HexSample(
-            color(sample, target.stage),
-            sample.elevation,
-            sample.complete,
-            arrow.x,
-            arrow.y,
-            sample.terrainRegionId,
-            regionKey,
-            tooltip);
-    }
-
-    private void publish(long ticket, RenderBuffer target) {
-        SwingUtilities.invokeLater(() -> { if (tickets.get() == ticket && buffer == target) repaint(); });
     }
 
     @Override
     protected void paintComponent(Graphics graphics) {
         super.paintComponent(graphics);
-        RenderBuffer current = buffer;
-        if (current == null) return;
-        int x = (int) Math.round(getWidth() / 2.0 + (current.originX - centerX) / current.unitsPerPixel);
-        int y = (int) Math.round(getHeight() / 2.0 - (current.originY - centerY) / current.unitsPerPixel);
-        graphics.drawImage(current.image, x, y, null);
-        if (hasRegionLabels(current.stage)) {
-            BufferedImage hovered = hoveredRegionOverlay(current, x, y);
-            if (hovered != null) graphics.drawImage(hovered, x, y, null);
-        }
-        BufferedImage motionArrows = current.motionArrows;
-        if (motionArrows != null) graphics.drawImage(motionArrows, x, y, null);
-        if (hasRegionLabels(current.stage)) {
-            paintTerrainLabels(graphics);
-            paintTerrainPresetInfo(graphics, current, x, y);
-        }
-        paintHeightInfo(graphics, current, x, y);
-    }
-
-    private BufferedImage hoveredRegionOverlay(RenderBuffer current, int imageX, int imageY) {
-        Point cursor = hoverPoint;
-        long key = 0L;
-        if (cursor != null) {
-            int pixelX = cursor.x - imageX, pixelY = cursor.y - imageY;
-            if (pixelX >= 0 && pixelY >= 0 && pixelX < current.width && pixelY < current.height) {
-                int index = pixelY * current.width + pixelX;
-                if (current.valid[index]) key = current.terrainRegionKeys[index];
-            }
-        }
-        if (current.hoveredRegionKey == key) return current.hoveredRegionOverlay;
-        current.hoveredRegionKey = key;
-        if (key == 0L) {
-            current.hoveredRegionOverlay = null;
-            return null;
-        }
-        BufferedImage overlay = new BufferedImage(current.width, current.height, BufferedImage.TYPE_INT_ARGB);
-        int[] pixels = ((DataBufferInt) overlay.getRaster()
-            .getDataBuffer()).getData();
-        int tint = Color.getHSBColor((float) ((key >>> 11) * 0x1.0p-53), 0.52f, 0.95f)
-            .getRGB() & 0x00FFFFFF;
-        int colored = 0x52000000 | tint;
-        for (int i = 0; i < pixels.length; i++) if (current.terrainRegionKeys[i] == key) pixels[i] = colored;
-        current.hoveredRegionOverlay = overlay;
-        return overlay;
-    }
-
-    private void paintTerrainLabels(Graphics graphics) {
-        WorldGenerator source = composer;
-        if (source == null) return;
-        List<TerrainLabel> labels = source.terrainLabels(worldBounds());
-        Graphics2D overlay = (Graphics2D) graphics.create();
-        overlay.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        float fontSize = (float) Math.max(10.0, Math.min(17.0, 10.0 + Math.log1p(zoom) * 2.5));
-        overlay.setFont(
-            overlay.getFont()
-                .deriveFont(Font.BOLD, fontSize));
-        FontMetrics metrics = overlay.getFontMetrics();
-        Font presetFont = overlay.getFont();
-        FontMetrics presetMetrics = overlay.getFontMetrics(presetFont);
+        if (world == null || stage == null || getWidth() <= 0 || getHeight() <= 0) return;
+        Graphics2D g = (Graphics2D) graphics.create();
         double scale = pixelsPerUnit();
-        for (TerrainLabel label : labels) {
-            int x = (int) Math.round(getWidth() * 0.5 + (label.worldX - centerX) * scale);
-            int y = (int) Math.round(getHeight() * 0.5 - (label.worldY - centerY) * scale);
-            if (x < -150 || y < -30 || x > getWidth() + 150 || y > getHeight() + 30) continue;
-            String text = label.text;
-            int textX = x - metrics.stringWidth(text) / 2;
-            int textY = y;
-            overlay.setColor(new Color(0, 0, 0, 210));
-            overlay.drawString(text, textX - 1, textY);
-            overlay.drawString(text, textX + 1, textY);
-            overlay.drawString(text, textX, textY - 1);
-            overlay.drawString(text, textX, textY + 1);
-            overlay.setColor(new Color(255, 250, 224, 245));
-            overlay.drawString(text, textX, textY);
-            overlay.setFont(presetFont);
-            int presetX = x - presetMetrics.stringWidth(label.presetText) / 2;
-            int presetY = textY + presetMetrics.getHeight();
-            overlay.setColor(new Color(0, 0, 0, 210));
-            overlay.drawString(label.presetText, presetX - 1, presetY);
-            overlay.drawString(label.presetText, presetX + 1, presetY);
-            overlay.drawString(label.presetText, presetX, presetY - 1);
-            overlay.drawString(label.presetText, presetX, presetY + 1);
-            overlay.setColor(new Color(190, 194, 198, 235));
-            overlay.drawString(label.presetText, presetX, presetY);
-            overlay.setFont(metrics.getFont());
-        }
-        overlay.dispose();
+        double left = centerX - getWidth() / (2.0 * scale);
+        double right = centerX + getWidth() / (2.0 * scale);
+        double bottom = centerY - getHeight() / (2.0 * scale);
+        double top = centerY + getHeight() / (2.0 * scale);
+        int firstX = (int) Math.floor(left / World.WIDTH);
+        int lastX = (int) Math.floor(right / World.WIDTH);
+        int firstY = (int) Math.floor(bottom / World.WIDTH);
+        int lastY = (int) Math.floor(top / World.WIDTH);
+        boolean vector = scale > VECTOR_RENDER_PIXELS_PER_UNIT;
+        if (vector) drawVectorHexes(g, scale, firstX, lastX, firstY, lastY);
+        else drawRasterTiles(g, scale, firstX, lastX, firstY, lastY);
+        drawTileBoundaries(g, scale, firstX, lastX, firstY, lastY);
+        drawArrows(g, scale, firstX, lastX, firstY, lastY);
+        drawContours(g, scale, firstX, lastX, firstY, lastY);
+        if (vector && showTreeIcons && hasTreeIcons(stage)) drawTreeIcons(g, scale, firstX, lastX, firstY, lastY);
+        drawHoverDetails(g);
+        g.dispose();
     }
 
-    private void paintTerrainPresetInfo(Graphics graphics, RenderBuffer current, int imageX, int imageY) {
-        Point cursor = hoverPoint;
-        WorldGenerator source = composer;
-        if (cursor == null || source == null) return;
-        int pixelX = cursor.x - imageX, pixelY = cursor.y - imageY;
-        if (pixelX < 0 || pixelY < 0 || pixelX >= current.width || pixelY >= current.height) return;
-        int index = pixelY * current.width + pixelX;
-        if (!current.valid[index] || current.terrainRegionKeys[index] == 0L) return;
-
-        double worldX = current.originX + (pixelX + 0.5) * current.unitsPerPixel;
-        double worldY = current.originY - (pixelY + 0.5) * current.unitsPerPixel;
-        double erosion = Math.max(0.0, Math.min(1.0, source.noiseErosionWeight(worldX, worldY)));
-        String regionText = current.tooltips[index];
-        String erosionText = String.format(Locale.ROOT, "%.1f%% Phacelle Noise Erosion", erosion * 100.0);
-        String baseText = String.format(Locale.ROOT, "%.1f%% Base Smooth Heightmap", (1.0 - erosion) * 100.0);
-
-        Graphics2D overlay = (Graphics2D) graphics.create();
-        overlay.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        int crossRadius = 6, crossGap = 2;
-        overlay.setColor(new Color(0, 0, 0, 220));
-        overlay.setStroke(new BasicStroke(3.0f));
-        overlay.drawLine(cursor.x - crossRadius, cursor.y, cursor.x - crossGap, cursor.y);
-        overlay.drawLine(cursor.x + crossGap, cursor.y, cursor.x + crossRadius, cursor.y);
-        overlay.drawLine(cursor.x, cursor.y - crossRadius, cursor.x, cursor.y - crossGap);
-        overlay.drawLine(cursor.x, cursor.y + crossGap, cursor.x, cursor.y + crossRadius);
-        overlay.setColor(Color.WHITE);
-        overlay.setStroke(new BasicStroke(1.0f));
-        overlay.drawLine(cursor.x - crossRadius, cursor.y, cursor.x - crossGap, cursor.y);
-        overlay.drawLine(cursor.x + crossGap, cursor.y, cursor.x + crossRadius, cursor.y);
-        overlay.drawLine(cursor.x, cursor.y - crossRadius, cursor.x, cursor.y - crossGap);
-        overlay.drawLine(cursor.x, cursor.y + crossGap, cursor.x, cursor.y + crossRadius);
-        FontMetrics metrics = overlay.getFontMetrics();
-        int paddingX = 9, paddingY = 7, lineGap = 3;
-        int boxWidth = Math.max(
-            metrics.stringWidth(regionText),
-            Math.max(metrics.stringWidth(erosionText), metrics.stringWidth(baseText))) + paddingX * 2;
-        int boxHeight = metrics.getHeight() * 3 + lineGap * 2 + paddingY * 2;
-        int boxX = cursor.x + 14, boxY = cursor.y + 18;
-        if (boxX + boxWidth > getWidth() - 4) boxX = cursor.x - boxWidth - 14;
-        if (boxY + boxHeight > getHeight() - 4) boxY = cursor.y - boxHeight - 14;
-        boxX = Math.max(4, boxX);
-        boxY = Math.max(4, boxY);
-        overlay.setColor(new Color(0, 0, 0, 205));
-        overlay.fillRoundRect(boxX, boxY, boxWidth, boxHeight, 10, 10);
-        int textX = boxX + paddingX;
-        int firstY = boxY + paddingY + metrics.getAscent();
-        overlay.setColor(new Color(255, 250, 224));
-        overlay.drawString(regionText, textX, firstY);
-        overlay.setColor(new Color(235, 235, 235));
-        overlay.drawString(erosionText, textX, firstY + metrics.getHeight() + lineGap);
-        overlay.setColor(new Color(190, 194, 198));
-        overlay.drawString(baseText, textX, firstY + (metrics.getHeight() + lineGap) * 2);
-        overlay.dispose();
-    }
-
-    private static void renderMotionArrows(RenderBuffer target) {
-        BufferedImage overlay = new BufferedImage(target.width, target.height, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D arrows = overlay.createGraphics();
-        arrows.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        arrows.setColor(new Color(255, 255, 255, 225));
-        double scale = 1.0 / target.unitsPerPixel;
-        for (Entry<Long, HexSample> entry : target.samples.entrySet()) {
-            long key = entry.getKey();
-            int q = (int) key, r = (int) (key >>> 32);
-            // This parity class is an independent set on the axial grid: none of
-            // its six direct neighbors is selected, and it contains 1/4 of cells.
-            if ((q & 1) != 0 || (r & 1) != 0) continue;
-            double worldX = q + r;
-            double worldY = (q - r) * Math.sqrt(3.0) / 3.0;
-            double sx = (worldX - target.originX) * scale;
-            double sy = (target.originY - worldY) * scale;
-            if (sx < -20 || sy < -20 || sx > target.width + 20 || sy > target.height + 20) continue;
-            HexSample sample = entry.getValue();
-            double speed = Math.hypot(sample.velocityX, sample.velocityY);
-            if (speed < 1.0e-9) continue;
-            double length = Math.min(scale * 0.78, scale * (0.22 + speed * 0.14));
-            double dx = sample.velocityX / speed * length;
-            double dy = -sample.velocityY / speed * length;
-            double startX = sx - dx * 0.42, startY = sy - dy * 0.42;
-            double endX = sx + dx * 0.58, endY = sy + dy * 0.58;
-            arrows.drawLine(
-                (int) Math.round(startX),
-                (int) Math.round(startY),
-                (int) Math.round(endX),
-                (int) Math.round(endY));
-            double head = Math.max(2.0, Math.min(5.0, scale * 0.3));
-            double ux = dx / length, uy = dy / length;
-            arrows.drawLine(
-                (int) Math.round(endX),
-                (int) Math.round(endY),
-                (int) Math.round(endX - ux * head - uy * head * 0.55),
-                (int) Math.round(endY - uy * head + ux * head * 0.55));
-            arrows.drawLine(
-                (int) Math.round(endX),
-                (int) Math.round(endY),
-                (int) Math.round(endX - ux * head + uy * head * 0.55),
-                (int) Math.round(endY - uy * head - ux * head * 0.55));
-        }
-        arrows.dispose();
-        target.motionArrows = overlay;
-    }
-
-    private void paintHeightInfo(Graphics graphics, RenderBuffer current, int imageX, int imageY) {
-        Point cursor = hoverPoint;
-        if (cursor == null || !(current.stage instanceof WorldStepDefinition)
-            || ((WorldStepDefinition) current.stage).tooltip == null) return;
-        int pixelX = cursor.x - imageX;
-        int pixelY = cursor.y - imageY;
-        if (pixelX < 0 || pixelY < 0 || pixelX >= current.width || pixelY >= current.height) return;
-        int index = pixelY * current.width + pixelX;
-        if (!current.valid[index]) return;
-
-        double worldX = current.originX + pixelX * current.unitsPerPixel;
-        double worldY = current.originY - pixelY * current.unitsPerPixel;
-        long blockX = (long) Math.floor(worldX * WorldGenerator.BLOCKS_PER_WORLD_UNIT);
-        long blockY = (long) Math.floor(current.elevations[index]);
-        long blockZ = (long) Math.floor(-worldY * WorldGenerator.BLOCKS_PER_WORLD_UNIT);
-        String text = current.tooltips[index] + " — X: " + blockX + "   Y: " + blockY + "   Z: " + blockZ;
-
-        Graphics2D overlay = (Graphics2D) graphics.create();
-        overlay.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-        FontMetrics metrics = overlay.getFontMetrics();
-        int paddingX = 8;
-        int paddingY = 6;
-        int boxWidth = metrics.stringWidth(text) + paddingX * 2;
-        int boxHeight = metrics.getHeight() + paddingY * 2;
-        int boxX = cursor.x + 14;
-        int boxY = cursor.y + 18;
-        if (boxX + boxWidth > getWidth() - 4) boxX = cursor.x - boxWidth - 14;
-        if (boxY + boxHeight > getHeight() - 4) boxY = cursor.y - boxHeight - 14;
-        boxX = Math.max(4, boxX);
-        boxY = Math.max(4, boxY);
-        overlay.setColor(new Color(0, 0, 0, 190));
-        overlay.fillRoundRect(boxX, boxY, boxWidth, boxHeight, 10, 10);
-        overlay.setColor(Color.WHITE);
-        overlay.drawString(text, boxX + paddingX, boxY + paddingY + metrics.getAscent());
-        overlay.dispose();
-    }
-
-    private static int color(ComposedSample sample, GenerationStep stage) {
-        if (stage instanceof StepDefinition) {
-            StepDefinition continentStage = (StepDefinition) stage;
-            if (!sample.loadedCategory && continentStage.index < 3) return BACKGROUND.getRGB();
-            return continentStage.colour.applyAsInt(hex(sample));
-        }
-        return ((WorldStepDefinition) stage).colour.applyAsInt(sample);
-    }
-
-    private static boolean isBlockHeightmap(GenerationStep stage) {
-        return stage instanceof WorldStepDefinition;
-    }
-
-    private static boolean hasArrows(GenerationStep stage) {
-        return stage instanceof StepDefinition && ((StepDefinition) stage).arrow != null;
-    }
-
-    private static boolean hasRegionLabels(GenerationStep stage) {
-        return stage instanceof StepDefinition && ((StepDefinition) stage).labels != null;
-    }
-
-    private static Hex hex(ComposedSample sample) {
-        Hex hex = new Hex();
-        hex.plateId = sample.plateId;
-        hex.oceanic = sample.oceanic;
-        hex.velocity = new Vec2(sample.velocityX, sample.velocityY);
-        hex.convergence = sample.convergence;
-        hex.divergence = sample.divergence;
-        hex.height = sample.elevation;
-        hex.terrainRegionId = sample.terrainRegionId;
-        hex.erosionWeight = sample.noiseErosionWeight;
-        return hex;
-    }
-
-    private static void colorizeTerrainRegionContours(RenderBuffer target) {
-        for (int y = 0; y < target.height - 1; y++) {
-            for (int x = 0; x < target.width - 1; x++) {
-                int index = y * target.width + x;
-                if (!target.valid[index]) continue;
-                int east = index + 1, south = index + target.width;
-                int region = target.terrainRegionIds[index];
-                boolean boundary = region != target.terrainRegionIds[east] || region != target.terrainRegionIds[south];
-                if (boundary) target.pixels[index] = shade(target.pixels[index], 0.55);
+    private void drawRasterTiles(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        BufferedImage base = stageImages.computeIfAbsent(stage.index, ignored -> rasterize(world, stage));
+        BufferedImage image = showTreeIcons && hasTreeIcons(stage)
+            ? stageImagesWithTrees.computeIfAbsent(stage.index, ignored -> bakeOverviewTreeIcons(base))
+            : base;
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        for (int tileY = firstY; tileY <= lastY; tileY++) {
+            for (int tileX = firstX; tileX <= lastX; tileX++) {
+                double x = getWidth() * 0.5 + (tileX * World.WIDTH - centerX) * scale;
+                double y = getHeight() * 0.5 - ((tileY + 1) * World.WIDTH - centerY) * scale;
+                int size = (int) Math.ceil(World.WIDTH * scale);
+                g.drawImage(image, (int) Math.floor(x), (int) Math.floor(y), size, size, null);
             }
         }
     }
 
-    private static void colorizeHeightmap(RenderBuffer target) {
-        for (int y = 0; y < target.height; y++) {
-            for (int x = 0; x < target.width; x++) {
-                colorizeHeightmapPixel(target, x, y);
+    private void drawVectorHexes(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        HexGrid<Hex> grid = world.preview(stage.index);
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+        for (int tileY = firstY; tileY <= lastY; tileY++) {
+            double offsetY = tileY * World.WIDTH;
+            for (int tileX = firstX; tileX <= lastX; tileX++) {
+                double offsetX = tileX * World.WIDTH;
+                for (AxialCoordinate coordinate : grid.coordinates) {
+                    Vec2 point = coordinate.toWorld();
+                    double worldX = point.x + offsetX;
+                    double worldY = point.y + offsetY;
+                    int centerScreenX = screenX(worldX, scale);
+                    int centerScreenY = screenY(worldY, scale);
+                    int halfWidth = (int) Math.ceil(scale * 2.0 / 3.0);
+                    int halfHeight = (int) Math.ceil(scale * HEX_HALF_HEIGHT);
+                    if (centerScreenX + halfWidth < 0 || centerScreenX - halfWidth > getWidth()
+                        || centerScreenY + halfHeight < 0
+                        || centerScreenY - halfHeight > getHeight()) continue;
+                    int colour = stage.colour.applyAsInt(grid.get(coordinate));
+                    if (stage.slopeShading) colour = slopeShade(grid, point, colour);
+                    g.setColor(new Color(colour));
+                    g.fill(hexagon(centerScreenX, centerScreenY, scale));
+                }
             }
         }
     }
 
-    private static void colorizeHeightmapDependencies(RenderBuffer target, int x, int y) {
-        colorizeHeightmapPixel(target, x, y);
-        colorizeHeightmapPixel(target, x - 2, y);
-        colorizeHeightmapPixel(target, x + 2, y);
-        colorizeHeightmapPixel(target, x, y - 2);
-        colorizeHeightmapPixel(target, x, y + 2);
+    private static Path2D hexagon(int centerX, int centerY, double scale) {
+        double wide = scale * 2.0 / 3.0 + HEX_OVERDRAW_PIXELS;
+        double narrow = scale / 3.0 + HEX_OVERDRAW_PIXELS * 0.5;
+        double high = scale * HEX_HALF_HEIGHT + HEX_OVERDRAW_PIXELS;
+        Path2D path = new Path2D.Double();
+        path.moveTo(centerX - wide, centerY);
+        path.lineTo(centerX - narrow, centerY - high);
+        path.lineTo(centerX + narrow, centerY - high);
+        path.lineTo(centerX + wide, centerY);
+        path.lineTo(centerX + narrow, centerY + high);
+        path.lineTo(centerX - narrow, centerY + high);
+        path.closePath();
+        return path;
     }
 
-    private static void colorizeHeightmapPixel(RenderBuffer target, int x, int y) {
-        if (x < 0 || y < 0 || x >= target.width || y >= target.height) return;
-        int index = y * target.width + x;
-        if (!target.valid[index]) return;
-        int west = neighbor(target, x - 2, y, index);
-        int east = neighbor(target, x + 2, y, index);
-        int north = neighbor(target, x, y - 2, index);
-        int south = neighbor(target, x, y + 2, index);
-        double denominator = Math.max(1.0, 4.0 * target.unitsPerPixel * WorldGenerator.BLOCKS_PER_WORLD_UNIT);
-        double dx = (target.elevations[east] - target.elevations[west]) / denominator;
-        double dy = (target.elevations[south] - target.elevations[north]) / denominator;
+    private void drawTileBoundaries(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        g.setColor(new Color(255, 255, 255, 90));
+        g.setStroke(new BasicStroke(1.5f));
+        for (int tileY = firstY; tileY <= lastY; tileY++) for (int tileX = firstX; tileX <= lastX; tileX++) {
+            int x = screenX(tileX * World.WIDTH, scale);
+            int y = screenY((tileY + 1) * World.WIDTH, scale);
+            int size = (int) Math.round(World.WIDTH * scale);
+            g.drawRect(x, y, size, size);
+        }
+    }
+
+    private void drawArrows(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        if (stage.arrow == null || scale < 2.0) return;
+        HexGrid<Hex> grid = world.preview(stage.index);
+        g.setStroke(new BasicStroke(1.2f));
+        g.setColor(new Color(255, 255, 255, 175));
+        int spacing = scale > 8.0 ? 6 : 12;
+        for (int tileY = firstY; tileY <= lastY; tileY++) for (int tileX = firstX; tileX <= lastX; tileX++) {
+            for (int y = spacing / 2; y < World.WIDTH; y += spacing)
+                for (int x = spacing / 2; x < World.WIDTH; x += spacing) {
+                    Hex hex = grid.getWrapped(AxialCoordinate.fromWorld(new Vec2(x, y)));
+                    Vec2 arrow = stage.arrow.apply(hex);
+                    double length = Math.hypot(arrow.x, arrow.y);
+                    if (length <= 1.0e-9) continue;
+                    double factor = Math.min(spacing * 0.38, length * 2.0) / length;
+                    int sx = screenX(tileX * World.WIDTH + x, scale);
+                    int sy = screenY(tileY * World.WIDTH + y, scale);
+                    int ex = screenX(tileX * World.WIDTH + x + arrow.x * factor, scale);
+                    int ey = screenY(tileY * World.WIDTH + y + arrow.y * factor, scale);
+                    g.drawLine(sx, sy, ex, ey);
+                    double screenLength = Math.hypot(ex - sx, ey - sy);
+                    if (screenLength < 2.0) continue;
+                    double headLength = Math.min(5.0, screenLength * 0.45);
+                    double dx = (ex - sx) / screenLength * headLength;
+                    double dy = (ey - sy) / screenLength * headLength;
+                    g.draw(new Line2D.Double(ex, ey, ex - dx - dy * 0.55, ey - dy + dx * 0.55));
+                    g.draw(new Line2D.Double(ex, ey, ex - dx + dy * 0.55, ey - dy - dx * 0.55));
+                }
+        }
+    }
+
+    private void drawContours(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        if (stage.contourGroup == null) return;
+        Path2D contours = stageContours.computeIfAbsent(stage.index, ignored -> buildContours(world, stage));
+        Graphics2D overlay = (Graphics2D) g.create();
+        overlay.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        overlay.translate(getWidth() * 0.5 - centerX * scale, getHeight() * 0.5 + centerY * scale);
+        overlay.scale(scale, -scale);
+        overlay.setStroke(new BasicStroke((float) (1.15 / scale), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        overlay.setColor(new Color(248, 239, 210, 210));
+        for (int tileY = firstY - 1; tileY <= lastY + 1; tileY++) {
+            for (int tileX = firstX - 1; tileX <= lastX + 1; tileX++) {
+                double x = tileX * World.WIDTH;
+                double y = tileY * World.WIDTH;
+                if (screenX(x + World.WIDTH + 1, scale) < 0 || screenX(x - 1, scale) > getWidth()
+                    || screenY(y - 1, scale) < 0
+                    || screenY(y + World.WIDTH + 1, scale) > getHeight()) continue;
+                overlay.translate(x, y);
+                overlay.draw(contours);
+                overlay.translate(-x, -y);
+            }
+        }
+        overlay.dispose();
+    }
+
+    static Path2D buildContours(World world, StepDefinition stage) {
+        HexGrid<Hex> grid = world.preview(stage.index);
+        Path2D path = new Path2D.Double();
+        double[] vertexX = { 2.0 / 3.0, 1.0 / 3.0, -1.0 / 3.0, -2.0 / 3.0, -1.0 / 3.0, 1.0 / 3.0 };
+        double[] vertexY = { 0.0, HEX_HALF_HEIGHT, HEX_HALF_HEIGHT, 0.0, -HEX_HALF_HEIGHT, -HEX_HALF_HEIGHT };
+        for (AxialCoordinate coordinate : grid.coordinates) {
+            int group = stage.contourGroup.applyAsInt(grid.get(coordinate));
+            Vec2 center = coordinate.toWorld();
+            for (int direction = 0; direction < 6; direction++) {
+                AxialCoordinate neighbor = coordinate.neighbor(direction);
+                Hex adjacent = grid.get(neighbor);
+                // Interior edges are shared. At the wrap seam each tile needs its own edge.
+                if (adjacent != null && direction >= 3) continue;
+                if (adjacent == null) adjacent = grid.getWrapped(neighbor);
+                if (group == stage.contourGroup.applyAsInt(adjacent)) continue;
+                int next = (direction + 1) % 6;
+                path.moveTo(center.x + vertexX[direction], center.y + vertexY[direction]);
+                path.lineTo(center.x + vertexX[next], center.y + vertexY[next]);
+            }
+        }
+        return path;
+    }
+
+    static boolean hasTreeIcons(StepDefinition stage) {
+        return "biomes".equals(stage.id) || "terrain-regions".equals(stage.id) || "terrain-biomes".equals(stage.id);
+    }
+
+    private void drawTreeIcons(Graphics2D g, double scale, int firstX, int lastX, int firstY, int lastY) {
+        HexGrid<Hex> grid = world.preview(stage.index);
+        int size = (int) Math.round(scale * TREE_ICON_SIZE_PER_UNIT);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        for (int tileY = firstY; tileY <= lastY; tileY++) for (int tileX = firstX; tileX <= lastX; tileX++) {
+            for (AxialCoordinate coordinate : grid.coordinates) {
+                Vec2 point = coordinate.toWorld();
+                int x = screenX(tileX * World.WIDTH + point.x, scale) - size / 2;
+                int y = screenY(tileY * World.WIDTH + point.y, scale) - size / 2;
+                if (x + size < 0 || x >= getWidth() || y + size < 0 || y >= getHeight()) continue;
+                BufferedImage icon = treeIcons.get(grid.get(coordinate).dominantBiome);
+                if (icon != null) g.drawImage(icon, x, y, size, size, null);
+            }
+        }
+    }
+
+    private BufferedImage bakeOverviewTreeIcons(BufferedImage base) {
+        BufferedImage image = new BufferedImage(RASTER_SIZE, RASTER_SIZE, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = image.createGraphics();
+        g.drawImage(base, 0, 0, null);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        HexGrid<Hex> grid = world.preview(stage.index);
+        int size = OVERVIEW_TREE_ICON_SIZE;
+        for (AxialCoordinate coordinate : grid.coordinates) {
+            if (coordinate.q % OVERVIEW_TREE_STRIDE != 0 || coordinate.r % OVERVIEW_TREE_STRIDE != 0) continue;
+            BufferedImage icon = treeIcons.get(grid.get(coordinate).dominantBiome);
+            if (icon == null) continue;
+            Vec2 point = coordinate.toWorld();
+            int x = (int) Math.round(point.x * RASTER_PIXELS_PER_UNIT) - size / 2;
+            int y = (int) Math.round((World.WIDTH - point.y) * RASTER_PIXELS_PER_UNIT) - size / 2;
+            int wrapX = x < 0 ? RASTER_SIZE : x + size > RASTER_SIZE ? -RASTER_SIZE : 0;
+            int wrapY = y < 0 ? RASTER_SIZE : y + size > RASTER_SIZE ? -RASTER_SIZE : 0;
+            g.drawImage(icon, x, y, size, size, null);
+            if (wrapX != 0) g.drawImage(icon, x + wrapX, y, size, size, null);
+            if (wrapY != 0) g.drawImage(icon, x, y + wrapY, size, size, null);
+            if (wrapX != 0 && wrapY != 0) g.drawImage(icon, x + wrapX, y + wrapY, size, size, null);
+        }
+        g.dispose();
+        return image;
+    }
+
+    private static Map<Biome, BufferedImage> loadTreeIcons() {
+        Map<Biome, BufferedImage> icons = new EnumMap<>(Biome.class);
+        BufferedImage boreal = loadTreeIcon("boreal");
+        icons.put(Biome.BOREAL_FOREST, boreal);
+        icons.put(Biome.SNOWY_BOREAL_FOREST, boreal);
+        icons.put(Biome.TEMPERATE_FOREST, loadTreeIcon("temperate"));
+        icons.put(Biome.SAVANNA, loadTreeIcon("savanna"));
+        icons.put(Biome.JUNGLE, loadTreeIcon("jungle"));
+        return icons;
+    }
+
+    private static BufferedImage loadTreeIcon(String name) {
+        String path = "/assets/rwg3/preview/trees/" + name + ".png";
+        try (InputStream stream = PreviewCanvas.class.getResourceAsStream(path)) {
+            BufferedImage image = stream == null ? null : ImageIO.read(stream);
+            if (image == null) throw new IllegalStateException("Missing or invalid tree icon " + path);
+            return image;
+        } catch (IOException exception) {
+            throw new IllegalStateException("Could not read tree icon " + path, exception);
+        }
+    }
+
+    private int screenX(double worldX, double scale) {
+        return (int) Math.round(getWidth() * 0.5 + (worldX - centerX) * scale);
+    }
+
+    private int screenY(double worldY, double scale) {
+        return (int) Math.round(getHeight() * 0.5 - (worldY - centerY) * scale);
+    }
+
+    private void zoomAt(double screenX, double screenY, double factor) {
+        double oldScale = pixelsPerUnit();
+        double worldX = centerX + (screenX - getWidth() * 0.5) / oldScale;
+        double worldY = centerY - (screenY - getHeight() * 0.5) / oldScale;
+        zoom = Math.max(0.3, Math.min(30.0, zoom * factor));
+        double scale = pixelsPerUnit();
+        centerX = wrap(worldX - (screenX - getWidth() * 0.5) / scale);
+        centerY = wrap(worldY + (screenY - getHeight() * 0.5) / scale);
+        repaint();
+    }
+
+    private double pixelsPerUnit() {
+        return Math.max(0.01, Math.min(getWidth(), getHeight()) / World.WIDTH * 0.94 * zoom);
+    }
+
+    private void drawHoverDetails(Graphics2D g) {
+        if (hoverPoint == null || dragStart != null || !contains(hoverPoint)) return;
+        hoverTip.setTipText(hoverText(hoverPoint));
+        Dimension size = hoverTip.getPreferredSize();
+        int x = Math.max(0, Math.min(hoverPoint.x + 14, getWidth() - size.width));
+        int y = hoverPoint.y + 18;
+        if (y + size.height > getHeight()) y = Math.max(0, hoverPoint.y - size.height - 6);
+        hoverTip.setSize(size);
+        Graphics tipGraphics = g.create(x, y, size.width, size.height);
+        hoverTip.paint(tipGraphics);
+        tipGraphics.dispose();
+    }
+
+    private String hoverText(Point point) {
+        double scale = pixelsPerUnit();
+        double x = wrap(centerX + (point.x - getWidth() * 0.5) / scale);
+        double y = wrap(centerY - (point.y - getHeight() * 0.5) / scale);
+        Hex hex = world.preview(stage.index)
+            .getWrapped(AxialCoordinate.fromWorld(new Vec2(x, y)));
+        double blockX = (x - World.WIDTH * 0.5) * World.BLOCKS_PER_WORLD_UNIT;
+        double blockZ = -(y - World.WIDTH * 0.5) * World.BLOCKS_PER_WORLD_UNIT;
+        String detail = stage.tooltip == null ? "" : stage.tooltip.apply(hex);
+        return String.format(
+            Locale.ROOT,
+            "X %.0f, Z %.0f%s",
+            blockX,
+            blockZ,
+            detail == null || detail.isEmpty() ? "" : " — " + detail);
+    }
+
+    static BufferedImage rasterize(World world, StepDefinition stage) {
+        BufferedImage image = new BufferedImage(RASTER_SIZE, RASTER_SIZE, BufferedImage.TYPE_INT_RGB);
+        HexGrid<Hex> grid = world.preview(stage.index);
+        for (int py = 0; py < RASTER_SIZE; py++) {
+            double y = (RASTER_SIZE - py - 0.5) * World.WIDTH / RASTER_SIZE;
+            for (int px = 0; px < RASTER_SIZE; px++) {
+                double x = (px + 0.5) * World.WIDTH / RASTER_SIZE;
+                Vec2 point = new Vec2(x, y);
+                Hex hex = grid.getWrapped(AxialCoordinate.fromWorld(point));
+                int colour = stage.colour.applyAsInt(hex);
+                if (stage.slopeShading) colour = slopeShade(grid, point, colour);
+                image.setRGB(px, py, colour);
+            }
+        }
+        return image;
+    }
+
+    private static int slopeShade(HexGrid<Hex> grid, Vec2 point, int colour) {
+        double west = sampledBlockHeight(grid, point.x - SLOPE_SAMPLE_DISTANCE, point.y);
+        double east = sampledBlockHeight(grid, point.x + SLOPE_SAMPLE_DISTANCE, point.y);
+        double south = sampledBlockHeight(grid, point.x, point.y - SLOPE_SAMPLE_DISTANCE);
+        double north = sampledBlockHeight(grid, point.x, point.y + SLOPE_SAMPLE_DISTANCE);
+        double denominator = 2.0 * SLOPE_SAMPLE_DISTANCE * World.BLOCKS_PER_WORLD_UNIT;
+        double dx = (east - west) / denominator;
+        double dy = (south - north) / denominator;
         double light = Math.max(0.55, Math.min(1.35, 0.95 - dx * 0.45 - dy * 0.45));
-        int color = shade(PreviewDecorations.worldHeight(target.elevations[index]), light);
-        int contour = (int) Math.floor(target.elevations[index] / 10.0);
-        if (contour != (int) Math.floor(target.elevations[east] / 10.0)
-            || contour != (int) Math.floor(target.elevations[south] / 10.0)) {
-            color = shade(color, contour % 5 == 0 ? 0.48 : 0.70);
-        }
-        target.pixels[index] = color;
+        return shade(colour, light);
     }
 
-    private static int neighbor(RenderBuffer target, int x, int y, int fallback) {
-        if (x < 0 || y < 0 || x >= target.width || y >= target.height) return fallback;
-        int index = y * target.width + x;
-        return target.valid[index] ? index : fallback;
+    private static double sampledBlockHeight(HexGrid<Hex> grid, double x, double y) {
+        Hex sample = grid.getWrapped(AxialCoordinate.fromWorld(new Vec2(x, y)));
+        return World.blockHeight(sample.height);
     }
 
-    private static int shade(int color, double light) {
-        int red = Math.min(255, Math.max(0, (int) (((color >> 16) & 255) * light)));
-        int green = Math.min(255, Math.max(0, (int) (((color >> 8) & 255) * light)));
-        int blue = Math.min(255, Math.max(0, (int) ((color & 255) * light)));
+    private static int shade(int colour, double light) {
+        int red = clampColour((int) Math.round(((colour >> 16) & 255) * light));
+        int green = clampColour((int) Math.round(((colour >> 8) & 255) * light));
+        int blue = clampColour((int) Math.round((colour & 255) * light));
         return red << 16 | green << 8 | blue;
     }
 
-    private static Thread daemon(Runnable runnable, String name) {
-        Thread thread = new Thread(runnable, name);
-        thread.setDaemon(true);
-        return thread;
+    private static int clampColour(int value) {
+        return Math.max(0, Math.min(255, value));
     }
 
-    @Override
-    public void close() {
-        tickets.incrementAndGet();
-        panTimer.stop();
-        planRefreshTimer.stop();
-        coordinator.shutdownNow();
-        workers.shutdownNow();
+    private static double wrap(double value) {
+        double result = value % World.WIDTH;
+        return result < 0.0 ? result + World.WIDTH : result;
     }
 }

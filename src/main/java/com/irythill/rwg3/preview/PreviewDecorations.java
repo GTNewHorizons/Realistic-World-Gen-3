@@ -1,15 +1,12 @@
 package com.irythill.rwg3.preview;
 
 import java.awt.Color;
-import java.util.List;
 import java.util.Locale;
 
-import com.irythill.rwg3.procgen.continent.Continent;
-import com.irythill.rwg3.procgen.continent.Hex;
-import com.irythill.rwg3.procgen.continent.steps.TerrainRegionsStep.TerrainRegion;
-import com.irythill.rwg3.procgen.util.hex.Vec2;
-import com.irythill.rwg3.procgen.world.WorldGenerator;
-import com.irythill.rwg3.procgen.world.WorldGenerator.ComposedSample;
+import com.irythill.rwg3.util.hex.Vec2;
+import com.irythill.rwg3.world.Biome;
+import com.irythill.rwg3.world.Hex;
+import com.irythill.rwg3.world.steps.TerrainRegionsStep.TerrainRegionKind;
 
 /** Pure preview data extractors used by generator step registrations. */
 public final class PreviewDecorations {
@@ -20,6 +17,9 @@ public final class PreviewDecorations {
         new Color(140, 140, 133), new Color(199, 199, 199), new Color(250, 250, 252) };
     private static final double[] WATER_STOPS = { 0, .18, .36, .65, .84, 1 };
     private static final double[] LAND_STOPS = { 0, .45, .7, .82, .92, 1 };
+    private static final Color[] BIOMES = { new Color(225, 174, 77), new Color(166, 181, 65), new Color(28, 127, 52),
+        new Color(174, 147, 103), new Color(51, 101, 66), new Color(70, 139, 74), new Color(220, 227, 232),
+        new Color(117, 154, 137) };
 
     private PreviewDecorations() {}
 
@@ -31,7 +31,19 @@ public final class PreviewDecorations {
     }
 
     public static int oceanicPlates(Hex hex) {
-        return hex.oceanic ? new Color(30, 80, 200).getRGB() : plates(hex);
+        long mixed = Integer.toUnsignedLong(hex.plateId) * 0x9E3779B97F4A7C15L;
+        double random = (mixed >>> 11) * 0x1.0p-53;
+        if (hex.oceanic) {
+            float hue = (float) (0.54 + random * 0.10);
+            float saturation = (float) (0.62 + random * 0.25);
+            float brightness = (float) (0.58 + random * 0.32);
+            return Color.getHSBColor(hue, saturation, brightness)
+                .getRGB();
+        }
+        double hue = random * 0.73;
+        if (hue >= 0.45) hue += 0.27;
+        return Color.getHSBColor((float) hue, .68f, .84f)
+            .getRGB();
     }
 
     public static int movement(Hex hex) {
@@ -46,45 +58,77 @@ public final class PreviewDecorations {
     }
 
     public static int hexHeight(Hex hex) {
-        return normalizedHeight(hex.height, WorldGenerator.MINIMUM_OCEAN_HEIGHT, 1.0, 2.25);
-    }
-
-    public static int terrainRegion(Hex hex) {
-        return normalizedHeight(hex.height, WorldGenerator.MINIMUM_OCEAN_HEIGHT, 1.0, 2.25);
+        return normalizedHeight(hex.height, 0.12, 1.0, 2.25);
     }
 
     public static String terrainRegionTooltip(Hex hex) {
-        return hex.terrainRegionId == 0 ? null : "Terrain region " + hex.terrainRegionId;
+        return hex.terrainRegionKind == null ? "Ocean" : hex.terrainRegionKind.label;
     }
 
-    public static List<TerrainRegion> terrainRegionLabels(Continent continent) {
-        return continent.terrainRegions();
+    public static String terrainBiomeTooltip(Hex hex) {
+        if (hex.dominantBiome == null) return "Ocean";
+        String terrain = hex.terrainRegionKind == null ? TerrainRegionKind.UNCLASSIFIED.label
+            : hex.terrainRegionKind.label;
+        return terrain + " × " + hex.dominantBiome.label;
     }
 
-    public static int worldHeight(ComposedSample sample) {
-        return heightColor(sample.elevation);
+    public static int temperature(Hex hex) {
+        double normalized = normalize(hex.temperatureCelsius, -25.0, 35.0);
+        float hue = (float) (0.66 * (1.0 - normalized));
+        return Color.getHSBColor(hue, 0.78f, 0.92f)
+            .getRGB();
     }
 
-    public static int worldHeight(double height) {
-        return heightColor(height);
+    public static String temperatureTooltip(Hex hex) {
+        return String.format(Locale.ROOT, "%.1f °C", hex.temperatureCelsius);
     }
 
-    public static String heightTooltip(ComposedSample sample) {
-        return String.format(Locale.ROOT, "Height %.1f", sample.elevation);
+    public static int humidity(Hex hex) {
+        int dry = new Color(151, 113, 68).getRGB();
+        int wet = new Color(31, 111, 173).getRGB();
+        return mix(dry, wet, hex.humidityPercent / 100.0);
+    }
+
+    public static Vec2 windArrow(Hex hex) {
+        return hex.wind.multiply(3.0);
+    }
+
+    public static String climateTooltip(Hex hex) {
+        return String.format(
+            Locale.ROOT,
+            "%.1f °C, %.1f%% humidity, wind (%.2f, %.2f)",
+            hex.temperatureCelsius,
+            hex.humidityPercent,
+            hex.wind.x,
+            hex.wind.y);
+    }
+
+    public static int biome(Hex hex) {
+        if (hex.biomeWeights == null) return new Color(20, 63, 103).getRGB();
+        double red = 0.0, green = 0.0, blue = 0.0;
+        for (int index = 0; index < hex.biomeWeights.length; index++) {
+            double weight = hex.biomeWeights[index] / 100.0;
+            red += BIOMES[index].getRed() * weight;
+            green += BIOMES[index].getGreen() * weight;
+            blue += BIOMES[index].getBlue() * weight;
+        }
+        return new Color((int) Math.round(red), (int) Math.round(green), (int) Math.round(blue)).getRGB();
+    }
+
+    public static String biomeTooltip(Hex hex) {
+        if (hex.biomeWeights == null) return "Ocean";
+        StringBuilder result = new StringBuilder(hex.dominantBiome.label);
+        Biome[] biomes = Biome.values();
+        for (int index = 0; index < biomes.length; index++) {
+            if (hex.biomeWeights[index] < 1.0f) continue;
+            result.append(String.format(Locale.ROOT, ", %s %.0f%%", biomes[index].label, hex.biomeWeights[index]));
+        }
+        return result.toString();
     }
 
     private static int normalizedHeight(double height, double oceanMinimum, double seaLevel, double landMaximum) {
         return height <= seaLevel ? ramp(WATER, WATER_STOPS, normalize(height, oceanMinimum, seaLevel))
             : ramp(LAND, LAND_STOPS, normalize(height, seaLevel, landMaximum));
-    }
-
-    private static int heightColor(double height) {
-        if (height <= WorldGenerator.WATER_LEVEL) {
-            if (height < 8.0) return mix(0x06172D, 0x123D68, normalize(height, -64.0, 8.0));
-            return mix(0x123D68, 0x4AA1C7, normalize(height, 8.0, 62.0));
-        }
-        if (height < 125.0) return mix(0x3D8F45, 0x7C8179, normalize(height, 62.0, 125.0));
-        return mix(0x7C8179, 0xFAFDFF, normalize(height, 125.0, 230.0));
     }
 
     private static int ramp(Color[] colors, double[] stops, double value) {

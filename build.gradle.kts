@@ -19,17 +19,6 @@ tasks.register<JavaExec>("previewSmoke") {
     systemProperty("java.awt.headless", "true")
 }
 
-tasks.register<JavaExec>("previewPerf") {
-    group = "verification"
-    description = "Runs the deterministic headless preview sampling benchmark"
-    classpath = sourceSets.main.get().runtimeClasspath
-    mainClass.set("com.irythill.rwg3.preview.PreviewPerformance")
-    systemProperty("java.awt.headless", "true")
-    if (project.hasProperty("perfJfr")) {
-        jvmArgs("-XX:StartFlightRecording=filename=build/preview-perf.jfr,settings=profile,dumponexit=true")
-    }
-}
-
 tasks.named<Jar>("jar") {
     manifest {
         attributes["Main-Class"] = "com.irythill.rwg3.preview.PreviewLauncher"
